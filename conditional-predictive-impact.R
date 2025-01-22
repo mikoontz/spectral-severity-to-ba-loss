@@ -5,31 +5,53 @@ library(cpi)
 library(caret)
 library(rPref)
 
-set.seed(20240724)
+# set.seed(20240724)
+# 
+# # read data and set up spatial folds
+# # https://spatialsample.tidymodels.org/articles/spatialsample.html
+# ard = sf::st_read("data/ARD_08262024.gpkg") |>
+#   dplyr::filter(!is.na(pcnt_ba_mo)) |> 
+#   dplyr::select(-lat, -aspectRad)
+
+set.seed(20250121)
 
 # read data and set up spatial folds
 # https://spatialsample.tidymodels.org/articles/spatialsample.html
-ard = sf::st_read("data/ARD_08262024.gpkg") |>
+ard = sf::st_read("data/ARD_01212025.gpkg") |>
   dplyr::filter(!is.na(pcnt_ba_mo)) |> 
   dplyr::select(-lat, -aspectRad)
 
-ard_for_task = ard |> 
-  spatialsample::spatial_clustering_cv(v = 10)
+ard_for_task_by_ecoregion = ard |>
+  dplyr::filter(!(ecoregion %in% c("California interior chaparral and woodlands", "Great Basin shrub steppe"))) |> 
+  dplyr::group_by(ecoregion) |> 
+  dplyr::group_split() |> 
+  purrr::map(.f = spatialsample::spatial_clustering_cv, v = 5, .progress = TRUE)
 
-ard_with_spatial_folds = ard_for_task |>
-  purrr::pmap(.f = function(id, splits) {
-    
-    spatial_fold <- id
-    assessment_data =
-      splits |>
-      rsample::assessment() |>
-      sf::st_drop_geometry()
-    
-    return(cbind(assessment_data, spatial_fold))
-  }) |>
-  data.table::rbindlist() |>
-  dplyr::mutate(spatial_fold = factor(spatial_fold)) |>
-  tibble::as_tibble()
+x <- ard_for_task_by_ecoregion[[1]]
+
+ard_with_spatial_folds = ard_for_task_by_ecoregion |>
+  purrr::map(
+    .f = \(x) {
+      out <- x |> 
+        purrr::pmap(
+          .f = \(id, splits) {
+            
+            spatial_fold <- id
+            assessment_data =
+              splits |>
+              rsample::assessment() |>
+              sf::st_drop_geometry()
+            
+            return(cbind(assessment_data, spatial_fold))
+          }
+        ) |>
+        data.table::rbindlist() |>
+        dplyr::mutate(spatial_fold = factor(spatial_fold)) |>
+        tibble::as_tibble()
+      
+      out
+    }
+  )
 
 features = ard |> 
   sf::st_drop_geometry() |> 
@@ -53,7 +75,8 @@ hyperparameters = hyperparameters_full
 tune_validate_varselect_assess = function(variablesPerSplit, 
                                           bagFraction, 
                                           minLeafPopulation, 
-                                          resampling_approach) {
+                                          resampling_approach,
+                                          ecoregion) {
   
   library(mlr3verse)
   
