@@ -21,15 +21,43 @@ ard = sf::st_read("data/ARD_01212025.gpkg") |>
   dplyr::filter(!is.na(pcnt_ba_mo)) |> 
   dplyr::select(-lat, -aspectRad)
 
-ard_for_task_by_ecoregion = ard |>
-  dplyr::filter(!(ecoregion %in% c("California interior chaparral and woodlands", "Great Basin shrub steppe"))) |> 
+ecoregions_to_model <- ard |> 
+  sf::st_drop_geometry() |> 
   dplyr::group_by(ecoregion) |> 
+  dplyr::summarize(n = dplyr::n()) |> 
+  dplyr::filter(n >= 10) |> 
+  dplyr::pull(ecoregion)
+
+ecoregions_to_model <- c(
+  'Eastern Cascades forests', 
+  'Central-Southern Cascades Forests', 
+  'Sierra Nevada forests', 
+  'Klamath-Siskiyou forests', 
+  'South Central Rockies forests', 
+  'North Cascades conifer forests', 
+  'Northern Rockies conifer forests', 
+  'Blue Mountains forests', 
+  'Arizona Mountains forests', 
+  'Montana Valley and Foothill grasslands', 
+  'Wasatch and Uinta montane forests', 
+  'Colorado Plateau shrublands', 
+  'Colorado Rockies forests'
+)
+
+ard_for_task_by_ecoregion_grouped = ard |>
+  dplyr::filter(ecoregion %in% ecoregions_to_model) |> 
+  dplyr::group_by(ecoregion)
+
+ard_for_task_by_ecoregion <- ard_for_task_by_ecoregion_grouped |> 
   dplyr::group_split() |> 
-  purrr::map(.f = spatialsample::spatial_clustering_cv, v = 5, .progress = TRUE)
+  purrr::map(
+    .f = spatialsample::spatial_clustering_cv, 
+    v = 5, 
+    .progress = TRUE
+  ) |> 
+  setNames(dplyr::group_keys(ard_for_task_by_ecoregion_grouped)$ecoregion)
 
-x <- ard_for_task_by_ecoregion[[1]]
-
-ard_with_spatial_folds = ard_for_task_by_ecoregion |>
+ard_with_spatial_folds_by_ecoregion = ard_for_task_by_ecoregion |>
   purrr::map(
     .f = \(x) {
       out <- x |> 
@@ -55,7 +83,7 @@ ard_with_spatial_folds = ard_for_task_by_ecoregion |>
 
 features = ard |> 
   sf::st_drop_geometry() |> 
-  dplyr::select(-c(PlotID, YrFireName, Dataset, pcnt_ba_mo, UniqueID)) |> 
+  dplyr::select(-c(PlotID, YrFireName, Dataset, pcnt_ba_mo, UniqueID, ecoregion)) |> 
   colnames()
 
 target = "pcnt_ba_mo"
@@ -66,7 +94,8 @@ hyperparameters_full =
   expand.grid(
     variablesPerSplit = 3:12, 
     bagFraction = c(0.4, 0.5, (1 - 1/exp(1)), 0.7, 0.8, 0.9),
-    minLeafPopulation = c(1, 5, 10, 25, 50, 60, 70, 80, 90, 100, 125, 150)
+    minLeafPopulation = c(1, 5, 10, 25, 50, 60, 70, 80, 90, 100, 125, 150),
+    ecoregion = ecoregions_to_model
   )
 
 # hyperparameters = hyperparameters_full[sample(x = 1:nrow(hyperparameters_full), size = 10), ]
@@ -79,6 +108,8 @@ tune_validate_varselect_assess = function(variablesPerSplit,
                                           ecoregion) {
   
   library(mlr3verse)
+  
+  ard_with_spatial_folds <- ard_with_spatial_folds_by_ecoregion[[ecoregion]]
   
   # Set up the leaner with the (currently) 3 hyperparameters
   learner_sev_biomass <- mlr3::lrn(
@@ -136,18 +167,32 @@ tune_validate_varselect_assess = function(variablesPerSplit,
   
   # Pull out a specific model skill metric aggregated across the spatial folds
   obs_preds_full = assessment_full$predictions(predict_sets = "test") |> 
-    purrr::map(.f = \(x) tibble::tibble(
+    purrr::imap(.f = \(x, idx) tibble::tibble(
       obs = getElement(x, "truth"), 
-      preds = getElement(x, "response")
+      pred = getElement(x, "response"),
+      spatial_fold = idx,
     )
     ) |> 
     data.table::rbindlist()
   
-  pred_full = obs_preds_full$preds
+  pred_full = obs_preds_full$pred
   obs_full = obs_preds_full$obs
   
+  r2_derivatives_full <- obs_preds_full |> 
+    dplyr::group_by(spatial_fold) |> 
+    dplyr::summarize(r2 = caret::R2(pred, obs)) |> 
+    dplyr::summarize(
+      r2_mean_across_spatial_folds = mean(r2, na.rm = TRUE),
+      r2_stdev_across_spatial_folds = sd(r2, na.rm = TRUE),
+      r2_na_count = sum(is.na(r2))
+    ) |> 
+    suppressWarnings()
+  
+  r2_full <- r2_derivatives_full$r2_mean_across_spatial_folds
+  r2_stdev_full <- r2_derivatives_full$r2_stdev_across_spatial_folds
+  r2_na_count_full <- r2_derivatives_full$r2_na_count
+  
   rmse_full = assessment_full$aggregate(measures = msr("regr.rmse"))
-  r2_full = assessment_full$aggregate(measures = msr("regr.rsq"))
   mae_full = assessment_full$aggregate(measures = msr("regr.mae"))
   mse_full = assessment_full$aggregate(measures = msr("regr.mse"))
   
@@ -190,23 +235,38 @@ tune_validate_varselect_assess = function(variablesPerSplit,
     )
     
     obs_preds_important_variables = assessment_important_variables$predictions(predict_sets = "test") |> 
-      purrr::map(.f = \(x) tibble::tibble(
+      purrr::imap(.f = \(x, idx) tibble::tibble(
         obs = getElement(x, "truth"), 
-        preds = getElement(x, "response")
+        pred = getElement(x, "response"),
+        spatial_fold = idx
       )
       ) |> 
       data.table::rbindlist()
     
-    pred_important_variables = obs_preds_important_variables$preds
+    pred_important_variables = obs_preds_important_variables$pred
     obs_important_variables = obs_preds_important_variables$obs
     
     # Pull out a specific model skill metric aggregated across the spatial folds
+    # Not relying on mlr3 approach gives us some more control, like the ability
+    # to calculate a measure of spread of the model skill metric across spatial
+    # folds in addition to its central tendency, or an ability to drop NAs in
+    # doing either calculation
+    r2_derivatives_important_variables <- obs_preds_important_variables |> 
+      dplyr::group_by(spatial_fold) |> 
+      dplyr::summarize(r2 = caret::R2(pred, obs)) |> 
+      dplyr::summarize(
+        r2_mean_across_spatial_folds = mean(r2, na.rm = TRUE),
+        r2_stdev_across_spatial_folds = sd(r2, na.rm = TRUE),
+        r2_na_count = sum(is.na(r2))
+      ) |> 
+      suppressWarnings()
+    
+    r2_important_variables <- r2_derivatives_important_variables$r2_mean_across_spatial_folds
+    r2_stdev_important_variables <- r2_derivatives_important_variables$r2_stdev_across_spatial_folds
+    r2_na_count_important_variables <- r2_derivatives_important_variables$r2_na_count
+    
     rmse_important_variables = assessment_important_variables$aggregate(
       measures = msr("regr.rmse")
-    )
-    
-    r2_important_variables = assessment_important_variables$aggregate(
-      measures = msr("regr.rsq")
     )
     
     mae_important_variables = assessment_important_variables$aggregate(
@@ -227,6 +287,8 @@ tune_validate_varselect_assess = function(variablesPerSplit,
     
     rmse_important_variables = NA
     r2_important_variables = NA
+    r2_stdev_important_variables = NA
+    r2_na_count_important_variables = NA
     mae_important_variables = NA
     mse_important_variables = NA
     rmse_important_variables_overall = NA
@@ -242,11 +304,14 @@ tune_validate_varselect_assess = function(variablesPerSplit,
   # reduced set of variables when the mtry/variablesPerSplit hyperparameter is greater than the
   # number of variables in the model)
   out = tibble::tibble(
+    ecoregion = ecoregion,
     mtry = variablesPerSplit,
     sample.fraction = bagFraction,
     min.node.size = minLeafPopulation,
     rmse_full = rmse_full,
     r2_full = r2_full,
+    r2_stdev_full = r2_stdev_full,
+    r2_na_count_full = r2_na_count_full,
     mae_full = mae_full,
     mse_full = mse_full,
     rmse_full_overall = rmse_full_overall,
@@ -257,6 +322,8 @@ tune_validate_varselect_assess = function(variablesPerSplit,
     important_variable_rf_formula = important_variable_rf_formula,
     rmse_important_variables = rmse_important_variables,
     r2_important_variables = r2_important_variables,
+    r2_stdev_important_variables = r2_stdev_important_variables,
+    r2_na_count_important_variables = r2_na_count_important_variables,
     mae_important_variables = mae_important_variables,
     mse_important_variables = mse_important_variables,
     rmse_important_variables_overall = rmse_important_variables_overall,
@@ -267,20 +334,22 @@ tune_validate_varselect_assess = function(variablesPerSplit,
   ) |> 
     tidyr::unnest(cols = cpi_results)
   
-  return(out)
+  out
 }
 
 
 variablesPerSplit = hyperparameters$variablesPerSplit[1]
 bagFraction = hyperparameters$bagFraction[1]
 minLeafPopulation = hyperparameters$minLeafPopulation[1]
+ecoregion = hyperparameters$ecoregion[1]
 resampling_approach = "resampler"
 
 test_out = tune_validate_varselect_assess(
   variablesPerSplit = variablesPerSplit,
   bagFraction = bagFraction,
   minLeafPopulation = minLeafPopulation,
-  resampling_approach = resampling_approach
+  resampling_approach = resampling_approach,
+  ecoregion = ecoregion
 )
 
 # # Define the learner to be a {ranger} regression and give it the tuned hyperparameters
@@ -299,9 +368,9 @@ tictoc::toc()
 results = data.table::rbindlist(results_list)
 
 dir.create("data/processed")
-data.table::fwrite(x = results, file = "data/processed/conditional-predictive-impact-results_v4.0.csv")
+data.table::fwrite(x = results, file = "data/processed/conditional-predictive-impact-results_v5.0.csv")
 
-cpi_results_full = data.table::fread("data/processed/conditional-predictive-impact-results_v4.0.csv")
+cpi_results_full = data.table::fread("data/processed/conditional-predictive-impact-results_v5.0.csv")
 
 cpi_results = cpi_results_full |>
   dplyr::select(-Variable, -CPI, -SE, -test, -statistic, -estimate, -p.value, -ci.lo) |>
