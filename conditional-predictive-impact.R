@@ -21,6 +21,9 @@ ard = sf::st_read("data/ARD_01212025.gpkg") |>
   dplyr::filter(!is.na(pcnt_ba_mo)) |> 
   dplyr::select(-lat, -aspectRad)
 
+ard$x_4326 <- sf::st_coordinates(ard)[, "X"]
+ard$y_4326 <- sf::st_coordinates(ard)[, "Y"]
+
 ecoregions_to_model <- ard |> 
   sf::st_drop_geometry() |> 
   dplyr::group_by(ecoregion) |> 
@@ -28,21 +31,21 @@ ecoregions_to_model <- ard |>
   dplyr::filter(n >= 10) |> 
   dplyr::pull(ecoregion)
 
-ecoregions_to_model <- c(
-  'Eastern Cascades forests', 
-  'Central-Southern Cascades Forests', 
-  'Sierra Nevada forests', 
-  'Klamath-Siskiyou forests', 
-  'South Central Rockies forests', 
-  'North Cascades conifer forests', 
-  'Northern Rockies conifer forests', 
-  'Blue Mountains forests', 
-  'Arizona Mountains forests', 
-  'Montana Valley and Foothill grasslands', 
-  'Wasatch and Uinta montane forests', 
-  'Colorado Plateau shrublands', 
-  'Colorado Rockies forests'
-)
+# ecoregions_to_model <- c(
+#   'Eastern Cascades forests', 
+#   'Central-Southern Cascades Forests', 
+#   'Sierra Nevada forests', 
+#   'Klamath-Siskiyou forests', 
+#   'South Central Rockies forests', 
+#   'North Cascades conifer forests', 
+#   'Northern Rockies conifer forests', 
+#   'Blue Mountains forests', 
+#   'Arizona Mountains forests', 
+#   'Montana Valley and Foothill grasslands', 
+#   'Wasatch and Uinta montane forests', 
+#   'Colorado Plateau shrublands', 
+#   'Colorado Rockies forests'
+# )
 
 ard_for_task_by_ecoregion_grouped = ard |>
   dplyr::filter(ecoregion %in% ecoregions_to_model) |> 
@@ -83,7 +86,7 @@ ard_with_spatial_folds_by_ecoregion = ard_for_task_by_ecoregion |>
 
 features = ard |> 
   sf::st_drop_geometry() |> 
-  dplyr::select(-c(PlotID, YrFireName, Dataset, pcnt_ba_mo, UniqueID, ecoregion)) |> 
+  dplyr::select(-c(PlotID, YrFireName, Dataset, pcnt_ba_mo, UniqueID, ecoregion, x_4326, y_4326)) |> 
   colnames()
 
 target = "pcnt_ba_mo"
@@ -91,12 +94,13 @@ target = "pcnt_ba_mo"
 full_rf_formula = glue::glue("{target} ~ {paste(features, collapse = ' + ')}")
 
 hyperparameters_full =
-  expand.grid(
+  tidyr::expand_grid(
     variablesPerSplit = 3:12, 
     bagFraction = c(0.4, 0.5, (1 - 1/exp(1)), 0.7, 0.8, 0.9),
     minLeafPopulation = c(1, 5, 10, 25, 50, 60, 70, 80, 90, 100, 125, 150),
     ecoregion = ecoregions_to_model
-  )
+  ) |> 
+  dplyr::arrange(ecoregion, minLeafPopulation, bagFraction, variablesPerSplit)
 
 # hyperparameters = hyperparameters_full[sample(x = 1:nrow(hyperparameters_full), size = 10), ]
 hyperparameters = hyperparameters_full
@@ -305,6 +309,7 @@ tune_validate_varselect_assess = function(variablesPerSplit,
   # number of variables in the model)
   out = tibble::tibble(
     ecoregion = ecoregion,
+    n_obs = length(obs_full),
     mtry = variablesPerSplit,
     sample.fraction = bagFraction,
     min.node.size = minLeafPopulation,
@@ -337,11 +342,12 @@ tune_validate_varselect_assess = function(variablesPerSplit,
   out
 }
 
+idx <- 1
 
-variablesPerSplit = hyperparameters$variablesPerSplit[1]
-bagFraction = hyperparameters$bagFraction[1]
-minLeafPopulation = hyperparameters$minLeafPopulation[1]
-ecoregion = hyperparameters$ecoregion[1]
+variablesPerSplit = hyperparameters$variablesPerSplit[idx]
+bagFraction = hyperparameters$bagFraction[idx]
+minLeafPopulation = hyperparameters$minLeafPopulation[idx]
+ecoregion = hyperparameters$ecoregion[idx]
 resampling_approach = "resampler"
 
 test_out = tune_validate_varselect_assess(
@@ -368,9 +374,9 @@ tictoc::toc()
 results = data.table::rbindlist(results_list)
 
 dir.create("data/processed")
-data.table::fwrite(x = results, file = "data/processed/conditional-predictive-impact-results_v5.0.csv")
+data.table::fwrite(x = results, file = "data/processed/conditional-predictive-impact-results_v5.1.csv")
 
-cpi_results_full = data.table::fread("data/processed/conditional-predictive-impact-results_v5.0.csv")
+cpi_results_full = data.table::fread("data/processed/conditional-predictive-impact-results_v5.1.csv")
 
 cpi_results = cpi_results_full |>
   dplyr::select(-Variable, -CPI, -SE, -test, -statistic, -estimate, -p.value, -ci.lo) |>
@@ -418,10 +424,24 @@ top_results = structure(
   class = c("data.table", "data.frame")
 )
 
+measure_specs <- tibble::tibble(
+  .key = c("regr.rsq", "regr.rsq"),
+  predict_sets = c("test", "train"),  
+  id = paste(measures_chr, predict_sets, sep = "_")
+)
 
+measures <- purrr::pmap(measure_specs, .f = mlr3::msr)
 
+assessment_full$score(measures = measures) |> 
+  dplyr::summarize(
+    dplyr::across(
+      .cols = tidyselect::all_of(measure_specs$id), 
+      .fns =\(x) {sd(x, na.rm = TRUE)}
+    )
+  )
 
-
+assessment_full$score(measures = mlr3::msr("regr.rsq")) |> 
+  dplyr::summarize(sd_msr = sd(regr.rsq, na.rm = TRUE))
 
 
 
